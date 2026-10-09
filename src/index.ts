@@ -51,6 +51,21 @@ const INTERCOM_OUTBOX_RESULT = "intercom:outbox-result";
 
 const MARKER_START = "GOAL:START";
 const MARKER_CANCEL = "GOAL:CANCEL";
+const MARKER_STATUS = "GOAL:STATUS";
+
+/**
+ * Strict command grammar.
+ *
+ * The original matcher was `text.includes("GOAL:START")`, which let a peer that
+ * merely *described* the protocol start a real, paying, autonomous goal: a
+ * peer report quoting `` `GOAL:START <objective> --tokens 40000` `` created a
+ * live goal whose objective was that quoted paragraph. A description of the
+ * interface must never be able to invoke it, so a command must be the first
+ * non-empty line of the message body, unwrapped in code delimiters, outside any
+ * fenced block. Quoted, bulleted, prefixed, or mid-sentence occurrences are
+ * ignored.
+ */
+const COMMAND_RE = new RegExp(`^(${MARKER_START}|${MARKER_CANCEL}|${MARKER_STATUS})$`, "u");
 
 const SELF_ID = "pi-goal-intercom";
 const SELF_NAME = "pi-goal-intercom";
@@ -65,6 +80,27 @@ const TERMINAL_GOAL_STATUSES = new Set([
 	"paused",
 	"cleared",
 ]);
+/**
+ * Statuses pi-goal keeps in `activeGoal` after a run stops. pi-goal's managed
+ * cancel only pauses an *active* goal (run-protocol.ts refuses any other
+ * status), and a stopped goal still blocks `pi-goal:start`
+ * (`GOAL_ALREADY_EXISTS`), so these need a human `/goal clear` upstream.
+ */
+const STOPPED_GOAL_STATUSES = new Set([
+	"paused",
+	"blocked",
+	"usage_limited",
+	"budget_limited",
+]);
+/** Statuses meaning the goal is finished and there is nothing to cancel. */
+const FINISHED_GOAL_STATUSES = new Set(["complete", "cleared"]);
+
+/**
+ * How long to wait for pi-goal to confirm a cancel. It answers synchronously on
+ * the reject path and from the state snapshot on the accept path, so this only
+ * bounds the "pi-goal is absent" case.
+ */
+const CANCEL_CONFIRM_TIMEOUT_MS = 5_000;
 
 const LOG_PATH = process.env.PI_GOAL_INTERCOM_LOG || "/tmp/pi-goal-intercom.log";
 
@@ -121,12 +157,81 @@ function short(s: string, n = 64): string {
 	return collapsed.length > n ? `${collapsed.slice(0, n)}…` : collapsed;
 }
 
+/**
+ * Strip the pi-intercom envelope so "first line" means the sender's first line,
+ * not the delivery header. Inbound bodies look like:
+ *
+ *   **From NAME** (cwd)
+ *   _id … · seq … · sent … · injected …_
+ *   <actual message>
+ */
+function commandBody(text: string): string {
+	const lines = text.split("\n");
+	let i = 0;
+	while (i < lines.length) {
+		const line = lines[i].trim();
+		if (line === "") {
+			i++;
+			continue;
+		}
+		if (line.startsWith("**From ")) {
+			i++;
+			continue;
+		}
+		if (/^_id\b.*_$/.test(line)) {
+			i++;
+			break;
+		}
+		break;
+	}
+	return lines.slice(i).join("\n");
+}
+
+interface ParsedCommand {
+	kind: "START" | "CANCEL" | "STATUS";
+	/** Remainder of the command line plus any following lines. */
+	argument: string;
+}
+
+/**
+ * Recognise a command only in command position. Returns undefined for anything
+ * else, including a message that merely mentions a marker.
+ */
+export function parseCommand(text: string): ParsedCommand | undefined {
+	const lines = commandBody(text).split("\n");
+	let inFence = false;
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i].trim();
+		if (/^(`{3,}|~{3,})/.test(line)) {
+			inFence = !inFence;
+			continue;
+		}
+		if (inFence) continue;
+		if (line === "") continue;
+
+		// Only the first real line can carry a command. Anything quoted,
+		// bulleted, or wrapped in code delimiters is prose, not a command.
+		if (/^[`>"'\[\]*(#-]/.test(line)) return undefined;
+		const head = line.split(/\s/, 1)[0];
+		if (!COMMAND_RE.test(head)) return undefined;
+		// Derive the verb from the matched marker; capture groups would shift if
+		// MARKER_* strings ever change length or order.
+		const kind = head.slice("GOAL:".length) as ParsedCommand["kind"];
+		const restOfLine = line.slice(head.length).trim();
+		const tail = lines.slice(i + 1).join("\n").trim();
+		return { kind, argument: [restOfLine, tail].filter(Boolean).join("\n").trim() };
+	}
+	return undefined;
+}
+
 export default function goalIntercom(pi: ExtensionAPI): void {
 	// getSessionName() is an action method and MUST NOT be called in the factory
 	// (the extension runtime is not initialized yet during loading). Evaluate the
 	// session gate lazily on the first actionable event instead.
 	let gateDecided = false;
 	let allowed = false;
+	// Kept for operator-facing hints: a stuck goal must be cleared *in that session*.
+	let sessionLabel = "";
 	const gate = (): boolean => {
 		if (gateDecided) return allowed;
 		gateDecided = true;
@@ -142,6 +247,7 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 		allowed =
 			sessionName.startsWith("test") ||
 			process.env.PI_GOAL_INTERCOM_ALLOW === "1";
+		sessionLabel = sessionName || "this session";
 		log(`gate session=${JSON.stringify(sessionName)} allowed=${allowed}`);
 		return allowed;
 	};
@@ -149,8 +255,84 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 	// Message timestamps already handled this session (dedupe across the many
 	// `context` events a single run may fire).
 	const consumed = new Set<string>();
-	// runId of the most recent managed run started by this extension.
-	let lastRunId: string | undefined;
+
+	/**
+	 * The most recent run this extension started, live or settled. `lastStatus`
+	 * is what pi-goal actually reported, never what we hoped — replies and hints
+	 * are built from it so a sender is never told an action succeeded that did
+	 * not.
+	 */
+	interface ManagedRun {
+		runId: string;
+		objective: string;
+		sender?: IntercomSender;
+		/** True between the `active` state event and a terminal event. */
+		live: boolean;
+		settled: boolean;
+		/** Whether the per-run event listener is currently attached. */
+		listening: boolean;
+		lastStatus?: string;
+		/** Last status of the run this one replaced (for GOAL_ALREADY_EXISTS hints). */
+		previousStatus?: string;
+		unsubscribe: () => void;
+		cancelTimer?: ReturnType<typeof setTimeout>;
+		cancelSender?: IntercomSender;
+	}
+	let currentRun: ManagedRun | undefined;
+
+	function clearCancelTimer(run: ManagedRun): void {
+		if (run.cancelTimer === undefined) return;
+		clearTimeout(run.cancelTimer);
+		run.cancelTimer = undefined;
+	}
+
+	function settleRun(run: ManagedRun): void {
+		run.live = false;
+		run.settled = true;
+		clearCancelTimer(run);
+		if (run.listening) {
+			run.listening = false;
+			try {
+				run.unsubscribe();
+			} catch {
+				/* listener already released */
+			}
+		}
+	}
+
+	/**
+	 * Attach (or re-attach) the per-run listener. A cancel may arrive after a
+	 * terminal event released the listener, and we still need pi-goal's real
+	 * answer to it — so this is idempotent and re-armable.
+	 */
+	function attachRunListener(run: ManagedRun): void {
+		if (run.listening) return;
+		run.unsubscribe = pi.events.on(`pi-goal:event:${run.runId}`, (data) => {
+			handleRunEvent(run, data);
+		});
+		run.listening = true;
+	}
+
+	/** What a sender must do to get unstuck, based on the status we observed. */
+	function recoveryHint(status: string | undefined): string {
+		if (status && STOPPED_GOAL_STATUSES.has(status)) {
+			return ` The goal is ${status}, and pi-goal's managed cancel only pauses an ACTIVE goal — it leaves a stopped goal in place, where it keeps rejecting new starts. A human must run \`/goal clear\` in "${sessionLabel}", or \`/goal resume\` after raising the budget, before GOAL:START can succeed again.`;
+		}
+		if (status && FINISHED_GOAL_STATUSES.has(status)) {
+			return ` The goal already finished (${status}); there is nothing to cancel.`;
+		}
+		return ` No live managed run matched that cancel — the goal may already be cleared, or was started by hand with /goal.`;
+	}
+
+	function alreadyExistsHint(previousStatus: string | undefined): string {
+		if (previousStatus && STOPPED_GOAL_STATUSES.has(previousStatus)) {
+			return ` The previous goal ended as ${previousStatus} and pi-goal retains stopped goals, so it is not really "already running" — it is stuck. Send GOAL:CANCEL (it will be refused) or ask an operator to run \`/goal clear\` in "${sessionLabel}" first, then re-send with a budget that covers several full turns.`;
+		}
+		if (previousStatus && FINISHED_GOAL_STATUSES.has(previousStatus)) {
+			return ` The previous goal ended as ${previousStatus}; a manually started /goal may still be holding the slot.`;
+		}
+		return ` Another goal is genuinely active in "${sessionLabel}" — send GOAL:CANCEL first, or wait for its terminal reply.`;
+	}
 
 	function replyTo(sender: IntercomSender | undefined, message: string): void {
 		if (!sender) {
@@ -216,52 +398,23 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 			return;
 		}
 
+		// Capture the replaced run before overwriting it, so a GOAL_ALREADY_EXISTS
+		// rejection can name the status the previous goal actually died in.
+		const previousStatus = currentRun?.lastStatus ?? currentRun?.previousStatus;
 		const runId = `pgi-${randomUUID()}`;
-		lastRunId = runId;
-		let terminalReplied = false;
+		const run: ManagedRun = {
+			runId,
+			objective: objectiveText,
+			sender,
+			live: false,
+			settled: false,
+			listening: false,
+			previousStatus,
+			unsubscribe: () => {},
+		};
 
-		const unsubscribe = pi.events.on(`pi-goal:event:${runId}`, (data) => {
-			const event = (data ?? {}) as {
-				type?: string;
-				status?: string;
-				summary?: string;
-				reason?: string;
-				error?: { code?: string; message?: string };
-			};
-			log(
-				`event runId=${runId} type=${event.type ?? "?"} status=${event.status ?? "-"}`,
-			);
-			if (terminalReplied) {
-				// Extremely unlikely but guard against double replies.
-				return;
-			}
-			if (event.type === "error") {
-				terminalReplied = true;
-				replyTo(
-					sender,
-					`⚠️ GOAL:START rejected (${event.error?.code ?? "error"}): ${event.error?.message ?? event.reason ?? "no detail"}`,
-				);
-				unsubscribe();
-				return;
-			}
-			if (event.type !== "state") return;
-			if (event.status === "active") {
-				replyTo(sender, `▶️ GOAL active: ${short(objectiveText)}`);
-				return;
-			}
-			if (event.status && TERMINAL_GOAL_STATUSES.has(event.status)) {
-				terminalReplied = true;
-				const detail =
-					event.status === "complete"
-						? (event.summary ?? "completed")
-						: (event.reason ?? "no detail");
-				replyTo(
-					sender,
-					`${iconFor(event.status)} GOAL ${event.status}: ${short(objectiveText)} — ${short(detail, 160)}`,
-				);
-				unsubscribe();
-			}
-		});
+		attachRunListener(run);
+		currentRun = run;
 
 		log(
 			`start runId=${runId} objective=${JSON.stringify(objectiveText)} tokenBudget=${tokenBudget ?? "none"} sender=${sender?.name ?? sender?.id?.slice(0, 8) ?? "unknown"}`,
@@ -273,35 +426,161 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 		});
 	}
 
-	function handleCancel(reason: string | undefined, sender?: IntercomSender): void {
-		if (!lastRunId) {
-			replyTo(
-				sender,
-				"⚠️ GOAL:CANCEL ignored: no run was started by this extension in this session.",
-			);
+	/**
+	 * One listener per run handles start outcomes, terminal states, and cancel
+	 * confirmation, so every reply reports what pi-goal really did.
+	 */
+	function handleRunEvent(run: ManagedRun, data: unknown): void {
+		const event = (data ?? {}) as {
+			type?: string;
+			status?: string;
+			summary?: string;
+			reason?: string;
+			operation?: string;
+			error?: { code?: string; message?: string };
+		};
+		log(
+			`event runId=${run.runId} type=${event.type ?? "?"} status=${event.status ?? "-"} operation=${event.operation ?? "-"}`,
+		);
+
+		if (event.type === "error") {
+			const code = event.error?.code ?? "error";
+			const message = event.error?.message ?? event.reason ?? "no detail";
+			// A cancel is only "in flight" while its confirmation timer is armed;
+			// an error operation without one is pi-goal refusing a cancel we never sent.
+			const confirmingCancel = run.cancelTimer !== undefined;
+			clearCancelTimer(run);
+			if (confirmingCancel || event.operation === "cancel") {
+				replyTo(
+					run.cancelSender ?? run.sender,
+					`⚠️ GOAL:CANCEL refused (${code}): ${message}${recoveryHint(run.lastStatus)}`,
+				);
+			} else {
+				replyTo(
+					run.sender,
+					`⚠️ GOAL:START rejected (${code}): ${message}${code === "GOAL_ALREADY_EXISTS" ? alreadyExistsHint(run.previousStatus) : ""}`,
+				);
+			}
+			settleRun(run);
 			return;
 		}
-		const cleanReason = reason?.trim() || "goal cancelled via intercom";
-		log(`cancel runId=${lastRunId} reason=${JSON.stringify(cleanReason)}`);
-		pi.events.emit(GOAL_CANCEL_CHANNEL, {
-			runId: lastRunId,
-			reason: cleanReason,
-		});
-		replyTo(sender, `🛑 GOAL:CANCEL sent for run ${lastRunId.slice(0, 12)}…`);
+
+		if (event.type !== "state") return;
+		run.lastStatus = event.status;
+
+		if (event.status === "active") {
+			run.live = true;
+			replyTo(run.sender, `▶️ GOAL active: ${short(run.objective)}`);
+			return;
+		}
+
+		if (event.status && TERMINAL_GOAL_STATUSES.has(event.status)) {
+			run.live = false;
+			if (run.cancelTimer !== undefined) {
+				// This terminal state is the cancel we asked for: report the real status.
+				const target = run.cancelSender ?? run.sender;
+				clearCancelTimer(run);
+				replyTo(
+					target,
+					`🛑 GOAL cancelled: ${iconFor(event.status)} ${event.status}${
+						event.reason ? ` — ${short(event.reason, 160)}` : ""
+					}`,
+				);
+			} else {
+				const detail =
+					event.status === "complete"
+						? (event.summary ?? "completed")
+						: (event.reason ?? "no detail");
+				replyTo(
+					run.sender,
+					`${iconFor(event.status)} GOAL ${event.status}: ${short(run.objective)} — ${short(detail, 160)}${budgetRecoveryHint(event.status)}`,
+				);
+			}
+			settleRun(run);
+		}
 	}
 
-	function handleMessage(text: string, sender?: IntercomSender): void {
-		if (text.includes(MARKER_START)) {
-			const idx = text.indexOf(MARKER_START);
-			handleStart(text.slice(idx + MARKER_START.length).replace(/^:\s*/, ""), sender);
+	/**
+	 * A long-horizon goal reaching its budget is expected and recoverable, and the
+	 * recovery must preserve work. pi-goal's `/goal edit --tokens` raises the
+	 * ceiling on the SAME goal (commands.ts: `effectiveTokenBudget = tokenBudget ??
+	 * currentGoal.tokenBudget`), keeping objective, cumulative usage, and elapsed
+	 * time; `/goal clear` discards all of it. Say so, because clearing a goal that
+	 * ran for days is data loss dressed up as recovery.
+	 */
+	function budgetRecoveryHint(status: string | undefined): string {
+		if (status !== "budget_limited") return "";
+		return ` Recovery: ask a human to run \`/goal edit --tokens <higher>\` in "${sessionLabel}" — it raises the ceiling and resumes THIS goal with its objective, progress, and cumulative usage intact. Do NOT run \`/goal clear\`: that discards the objective and every accumulated turn. Budgets are cumulative across the whole run while each turn re-sends the full context, so a large goal legitimately needs a large budget.`;
+	}
+
+	function handleCancel(reason: string | undefined, sender?: IntercomSender): void {
+		const run = currentRun;
+		if (!run) {
+			replyTo(
+				sender,
+				"⚠️ GOAL:CANCEL ignored: this extension never started a goal in this session.",
+			);
 			return;
 		}
-		if (text.includes(MARKER_CANCEL)) {
-			const idx = text.indexOf(MARKER_CANCEL);
-			handleCancel(
-				text.slice(idx + MARKER_CANCEL.length).replace(/^:\s*/, "") || undefined,
-				sender,
+		// Never veto a cancel on our own cached observation. `lastStatus` is what we
+		// last saw, not what is true now — a human may have run `/goal resume`, in
+		// which case a cancel for a goal we believe stopped will legitimately
+		// succeed. pi-goal owns the state, so always ask it and report the answer.
+		attachRunListener(run);
+		run.settled = false;
+		const cleanReason = reason?.trim() || "goal cancelled via intercom";
+		run.cancelSender = sender ?? run.sender;
+		run.cancelTimer = setTimeout(() => {
+			run.cancelTimer = undefined;
+			replyTo(
+				run.cancelSender ?? run.sender,
+				`⚠️ GOAL:CANCEL got no confirmation from pi-goal within ${CANCEL_CONFIRM_TIMEOUT_MS / 1000}s; the goal may still be running. Check /goal status in "${sessionLabel}".`,
 			);
+			settleRun(run);
+		}, CANCEL_CONFIRM_TIMEOUT_MS);
+		log(`cancel runId=${run.runId} reason=${JSON.stringify(cleanReason)}`);
+		pi.events.emit(GOAL_CANCEL_CHANNEL, {
+			runId: run.runId,
+			reason: cleanReason,
+		});
+	}
+
+	function handleStatus(sender?: IntercomSender): void {
+		const run = currentRun;
+		if (!run) {
+			replyTo(
+				sender,
+				`ℹ️ GOAL:STATUS — no managed run has been observed in this session runtime. State is not recoverable across a session restart, so an empty answer here does NOT prove the slot is free; ask for \`/goal status\` in "${sessionLabel}".`,
+			);
+			return;
+		}
+		const state = run.live ? "live" : run.settled ? "settled" : "starting";
+		const lines = [
+			`ℹ️ GOAL:STATUS — run ${short(run.runId, 20)}`,
+			`state: ${state}`,
+			`last status reported by pi-goal: ${run.lastStatus ?? "(none yet)"}`,
+			`objective: ${short(run.objective, 120)}`,
+		];
+		if (run.previousStatus) lines.push(`replaced goal ended as: ${run.previousStatus}`);
+		if (!run.live && run.lastStatus && STOPPED_GOAL_STATUSES.has(run.lastStatus)) {
+			lines.push(
+				`STUCK: a stopped goal still occupies the slot and managed cancel cannot clear it; a human must run \`/goal clear\` (or \`/goal edit --tokens\` to keep its progress) in "${sessionLabel}".`,
+			);
+		}
+		replyTo(sender, lines.join("\n"));
+	}
+
+	function handleCommand(command: ParsedCommand, sender?: IntercomSender): void {
+		switch (command.kind) {
+			case "START":
+				handleStart(command.argument, sender);
+				return;
+			case "CANCEL":
+				handleCancel(command.argument || undefined, sender);
+				return;
+			case "STATUS":
+				handleStatus(sender);
+				return;
 		}
 	}
 
@@ -318,13 +597,23 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 			} | null;
 			if (!m || m.role !== "custom" || m.customType !== "intercom_message") continue;
 			const text = messageText(m.content);
-			if (!text.includes(MARKER_START) && !text.includes(MARKER_CANCEL)) continue;
-			const key = `${m.timestamp ?? "?"}:${text.length}`;
+			const command = parseCommand(text);
+			if (!command) continue;
+			const key = `${m.timestamp ?? "?"}:${text.length}:${command.kind}`;
 			if (consumed.has(key)) break;
 			consumed.add(key);
-			handleMessage(text, senderOf(m.details));
+			const sender = senderOf(m.details);
+			log(`command kind=${command.kind} from=${sender?.name ?? sender?.id?.slice(0, 8) ?? "?"}`);
+			handleCommand(command, sender);
 			break;
 		}
+	});
+
+	// Release the pending cancel timer and the run's event listener on teardown.
+	pi.on("session_shutdown", () => {
+		if (!currentRun) return;
+		settleRun(currentRun);
+		currentRun = undefined;
 	});
 }
 

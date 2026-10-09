@@ -13,12 +13,40 @@ it stays dependency-free and cannot break when those packages change internals:
 | --- | --- | --- |
 | `pi-goal:start` | emit | `{ runId, objective, tokenBudget? }` |
 | `pi-goal:cancel` | emit | `{ runId, reason }` |
-| `pi-goal:event:<runId>` | listen | `{ type: "state", runId, goalId, status, summary?, reason? }` or `{ type: "error", … }` |
+| `pi-goal:event:<runId>` | listen | `{ type: "state", runId, goalId, status, summary?, reason? }` or `{ type: "error", runId, operation, error: { code, message } }` |
 | `intercom:outbox-request` | emit | `{ version: 1, requestId, extensionId, extensionName, to, message }` |
 | `intercom:outbox-result` | listen | `{ requestId, status, code? }` — `sent`/`rejected`/`blocked`/`failed` are terminal |
 
 Goal runIds are `pgi-<uuid>`, which satisfies pi-goal's
 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`.
+
+## Two pi-goal behaviours this package exists around
+
+Both are upstream facts, verified in `src/run-protocol.ts`, and the extension is
+built to report them honestly instead of papering over them:
+
+1. **Cancel only pauses an `active` goal.** `cancelActiveRun` refuses any other
+   status (`goal.status !== "active"` → `RUN_NOT_FOUND`) after closing the managed
+   run, while `handleStart` rejects with `GOAL_ALREADY_EXISTS` as long as
+   `runtime.activeGoal` exists. So a stopped goal occupies the slot and nothing on
+   the bus can free it. `handleCancel` therefore always dispatches and reports
+   pi-goal's real answer — it must not veto on our cached `lastStatus`, because a
+   human may have resumed the goal — and `GOAL:STATUS` surfaces the stuck state.
+2. **There is no budget-raise channel.** Only start and cancel exist, so raising an
+   exhausted budget requires a human running `/goal edit --tokens`. Replies say so
+   because the safe recovery for long work is raising the ceiling, not clearing.
+
+## Why the command grammar is strict
+
+The first version matched `text.includes("GOAL:START")` anywhere in the body. On
+2026-10-09 a peer's bug report that *quoted* the marker inside backticks created a
+live goal whose objective was that quoted paragraph — a description of the
+interface invoked it and spent real money. `parseCommand` now requires the marker
+as the first non-empty line of the body (after stripping the pi-intercom delivery
+envelope), unwrapped in code delimiters and outside fenced blocks. `test/smoke.mjs`
+replays the verbatim inbound traffic from `test/fixtures/` and asserts zero goals
+start, with the coordinator's real commands from the same day as a positive
+control so the fix cannot degrade into "never fire".
 
 ## Why the `context` event is the trigger
 
@@ -72,12 +100,18 @@ Replies are sent for `active` plus these terminal states: `complete`,
 `RUN_ID_IN_USE`, `ACTIVATION_FAILED`). A guard ensures at most one terminal
 reply per run.
 
-## Cost caveat
+## Cost model
 
-pi-goal continues a goal automatically after the session goes idle. With
-pi-goal's `automaticTurns: null` there is no response-count cap, so an
-open-ended objective can run unbounded paid turns. Encourage `--tokens`, or
-configure a finite `automaticTurns` in `pi-goal.json`.
+The budget is cumulative for the whole run while each request re-sends the entire
+conversation, and `usage.totalTokens` includes cached prompt input. Cost is
+therefore `turns × contextTokens`, which makes context size — not turn count — the
+dominant lever for long goals.
+
+`automaticTurns: null` is the intended production setting: goals here may run for
+weeks, and a finite cap would pause legitimate work into a stopped state that needs
+a human to resume. Runaway loops are bounded instead by `continuationLimits.noProgressTurns`
+plus a fingerprint of repeated tool-free assistant output. Do not recommend a turn
+cap; recommend a budget sized to the horizon and lean sessions.
 
 ## Release flow
 

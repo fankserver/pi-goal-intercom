@@ -1,6 +1,6 @@
 {
   "name": "pi-goal-intercom",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension: start and cancel pi-goal managed runs from intercom messages (GOAL:START / GOAL:CANCEL), with status replies back to the sender.",
   "type": "module",
   "license": "MIT",

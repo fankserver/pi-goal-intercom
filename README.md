@@ -34,11 +34,15 @@ committed, so a git install needs no build.
 
 ## Usage
 
-Any intercom message body that reaches the target session:
+Any intercom message body that reaches the target session. A command must be the
+**first non-empty line of the message body**, unwrapped in code delimiters — a
+marker quoted mid-sentence, in backticks, in a blockquote, or in a fence is
+prose and is ignored:
 
 ```text
 GOAL:START <objective> [--tokens <N>]
 GOAL:CANCEL [reason]
+GOAL:STATUS
 ```
 
 From a sender session:
@@ -47,26 +51,65 @@ From a sender session:
 intercom({
   action: "send",
   to: "worker",
-  message: "GOAL:START finish README and commit it",
+  message: "GOAL:START finish README and commit it --tokens 800000",
 });
 ```
 
 Examples:
 
 ```text
-GOAL:START debug the flaky test in ./internal/policy until it is green --tokens 200000
+GOAL:START debug the flaky test in ./internal/policy until it is green --tokens 2000000
 GOAL:CANCEL owner changed direction
+GOAL:STATUS
 ```
 
-The sender gets status replies back over intercom:
+The sender gets status replies back over intercom, each reporting what pi-goal
+actually did rather than what was requested:
 
 ```text
 ▶️ GOAL active: finish README and commit it
 ✅ GOAL complete: finish README and commit it — <completion summary>
-⛔ GOAL blocked: … — <reason>          (also usage/budget/paused/cleared)
+⛔ GOAL blocked: … — <reason>          (also usage/paused/cleared)
+💰 GOAL budget_limited: … — token budget reached (1.2M/1M) Recovery: ask a human to run `/goal edit --tokens <higher>`…
+🛑 GOAL cancelled: paused — owner changed direction
+⚠️ GOAL:CANCEL refused (RUN_NOT_FOUND): … A human must run `/goal clear`…
 ⚠️ GOAL:START rejected (RPC_DISABLED): Managed run RPC is disabled.
-🛑 GOAL:CANCEL sent for run 12ab…
+ℹ️ GOAL:STATUS — run pgi-1a2b… / last status: budget_limited / STUCK…
 ```
+
+## Sizing `--tokens`
+
+The budget is cumulative across the whole goal run, and every model request
+re-sends the full conversation with cached prompt input billed. A real turn
+cost `input 39,837 + cacheRead 20,096 + output 93 = 60,026` tokens — 60k billed
+for 93 tokens of work. Therefore:
+
+```text
+cost ≈ turns × contextTokens   →   --tokens ≥ planned_turns × contextTokens × 1.3
+```
+
+Read `contextTokens` from `intercom list`. A budget below one turn is worse than
+no budget: it burns a request, produces nothing, and parks the goal in
+`budget_limited`, which then rejects every new start. Size for the whole
+horizon — some goals run for weeks, `automaticTurns` is unlimited by design, and
+runaway loops are caught by `noProgressTurns` plus repeated-output fingerprinting,
+not by a turn cap. For long goals the dominant lever is context size.
+
+## Recovering a stuck goal slot
+
+pi-goal's managed cancel only pauses a goal that is exactly `active`. A goal in
+`budget_limited`, `paused`, `blocked`, or `usage_limited` persists and keeps
+rejecting starts, and clearing it is not reachable over the event bus (only
+`pi-goal:start` and `pi-goal:cancel` exist). Both need a human in that session:
+
+- Budget exhausted on real work → **`/goal edit --tokens <higher>`**, which raises
+  the ceiling and resumes the same goal with objective, cumulative usage, and
+  elapsed time intact. **Not `/goal clear`** — that discards the objective and
+  every accumulated turn.
+- Goal genuinely wrong → `/goal clear`, which is still cheaper than restarting the
+  session (a restart also discards the session's context).
+
+Send `GOAL:STATUS` to detect this instead of guessing from `GOAL_ALREADY_EXISTS`.
 
 ## Bundled skill (so agents know it exists)
 
@@ -83,11 +126,12 @@ it with:
 /skill:pi-goal-intercom
 ```
 
-It documents both sides: sender-side `GOAL:START` / `GOAL:CANCEL` syntax and
-budgets, the status replies to expect, a failure table (`RPC_DISABLED`,
-`GOAL_ALREADY_EXISTS`, silent no-op), the session-name scope gate, and the
-things that **cannot** work (no goal-start tool; `/goal` in a message body is
-inert). Restart the session after installing so the skill is discovered.
+It documents both sides: sender-side `GOAL:START` / `GOAL:CANCEL` / `GOAL:STATUS`
+syntax, the strict command-position rule, budget sizing for long-horizon runs, the
+status replies to expect, a failure table (`RPC_DISABLED`, `GOAL_ALREADY_EXISTS`,
+silent no-op), stuck-slot recovery, the session-name scope gate, and the things
+that **cannot** work (no goal-start tool; `/goal` in a message body is inert).
+Restart the session after installing so the skill is discovered.
 
 ## Requirements
 
@@ -108,10 +152,12 @@ The extension is **inert unless explicitly allowed**:
 Everywhere else the `context` hook returns immediately, so installing it
 globally is safe: a stray `GOAL:START` reaching a non-test session is ignored.
 
-A started goal runs **paid autonomous turns** (pi-goal keeps going after the
-session goes idle, and `automaticTurns: null` means no response-count cap).
-Treat `GOAL:START` as a real instruction and pass `--tokens` for open-ended
-objectives. Status replies are feedback, not authorization.
+A started goal runs **paid autonomous turns**, and `automaticTurns: null` is the
+intended configuration for long-horizon goals — there is no response-count cap,
+because legitimate goals may run for weeks. The guards are therefore the
+cumulative `--tokens` budget (see *Sizing `--tokens`*) and pi-goal's no-progress
+detection. Treat `GOAL:START` as a real instruction and always pass a budget sized
+to the whole run. Status replies are feedback, not authorization.
 
 ## Development
 
