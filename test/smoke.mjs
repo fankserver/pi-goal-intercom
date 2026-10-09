@@ -645,6 +645,43 @@ check(
 	);
 }
 
+/* ------------------------ 6e. prose that OPENS with a token is still prose (real fire) */
+
+/*
+ * A peer answering a status query opened its reply with the token, and this extension
+ * executed it as a command — recorded in /tmp/pi-goal-intercom.log as
+ * `command kind=STATUS key=test-1|d85b10fe…`. Read-only, so low harm; the same shape
+ * opening with CANCEL would cancel a live goal, so the grammar cannot rely on
+ * "nobody starts a line with the token".
+ */
+{
+	const observed = envelope(
+		"peer-coordinator",
+		"GOAL:STATUS result — Active goal in this session: none. Most recent goal fb245fd2 (objective: \"experiment-goal-1\"): COMPLETED. No active goal right now.",
+	);
+	check(parseCommand(observed) === undefined, "a reported status answer is not a command", String(parseCommand(observed)?.kind));
+
+	check(parseCommand(envelope("peer", "GOAL:STATUS"))?.kind === "STATUS", "the bare verb still works");
+	check(
+		parseCommand(envelope("peer", "GOAL:CANCEL owner changed direction"))?.kind === "CANCEL",
+		"a one-line cancel with a reason still works",
+	);
+	check(
+		parseCommand(envelope("peer", "GOAL:CANCEL done\n\nAlso note the earlier run finished cleanly.")) === undefined,
+		"a cancel followed by a prose paragraph is not a command",
+	);
+	check(
+		parseCommand(envelope("peer", "GOAL:START multi line objective\nsecond line survives"))?.argument ===
+			"multi line objective\nsecond line survives",
+		"START still accepts a multi-line objective",
+	);
+
+	// And the observed prose must not be dispatched by the shipped extension either.
+	const t = await boot();
+	await t.deliverRaw(freshen(observed));
+	check(t.replies().length === 0, "the observed prose reply triggers no reply from the bridge", JSON.stringify(t.replies()));
+}
+
 /* -------------------------------------------------------- 7. scope gate holds */
 
 {

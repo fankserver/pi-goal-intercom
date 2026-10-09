@@ -106,9 +106,15 @@ const CANCEL_CONFIRM_TIMEOUT_MS = 5_000;
 
 const LOG_PATH = process.env.PI_GOAL_INTERCOM_LOG || "/tmp/pi-goal-intercom.log";
 
+// Every session on this machine appends to the same file, so an untagged line is
+// unattributable: during live validation the only way to tell which session logged
+// what was to infer it from a neighbouring `gate` line. PI_SESSION_ID is per process,
+// which also survives /reload re-running the factories.
+const PROCESS_TAG = (process.env.PI_SESSION_ID ?? process.pid.toString(36)).slice(0, 8);
+
 function log(msg: string): void {
 	try {
-		appendFileSync(LOG_PATH, `${new Date().toISOString()} ${msg}\n`);
+		appendFileSync(LOG_PATH, `${new Date().toISOString()} [${PROCESS_TAG}] ${msg}\n`);
 	} catch {
 		/* diagnostics must never break the session */
 	}
@@ -275,6 +281,15 @@ export function parseCommand(text: string): ParsedCommand | undefined {
 		const kind = head.slice("GOAL:".length) as ParsedCommand["kind"];
 		const restOfLine = line.slice(head.length).trim();
 		const tail = lines.slice(i + 1).join("\n").trim();
+		// STATUS takes no argument, so ANY trailing text on that line is evidence the
+		// writer is reporting on the protocol rather than invoking it. Observed in live
+		// traffic: a peer answering a status query opened its reply with
+		// "GOAL:STATUS result — Active goal in this session: none." and that was executed
+		// as a command. CANCEL is held to the same whole-body rule (its reason is
+		// optional, so a following paragraph is equally a sign of prose). START keeps
+		// multi-line objectives, which are genuinely part of the command.
+		if (kind === "STATUS" && (restOfLine !== "" || tail !== "")) return undefined;
+		if (kind === "CANCEL" && tail !== "") return undefined;
 		return { kind, argument: [restOfLine, tail].filter(Boolean).join("\n").trim() };
 	}
 	return undefined;
