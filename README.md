@@ -77,6 +77,16 @@ actually did rather than what was requested:
 ℹ️ GOAL:STATUS — run pgi-1a2b… / last status: budget_limited / STUCK…
 ```
 
+## Replay safety
+
+A resume or `/reload` re-presents the **entire** message history to the extension, so
+a command that already ran arrives again looking brand new. Commands are therefore
+**exactly-once per delivery**: the envelope delivery stamp must not predate this
+process, and the delivery id is recorded durably in
+`~/.pi/agent/pi-goal-intercom-processed.json` (`PI_GOAL_INTERCOM_STATE_DIR`
+overrides). Restarting a session will not silently re-run its last goal — which also
+means re-pasting the same objective text will not re-fire it; send a new message.
+
 ## Sizing `--tokens`
 
 The budget is cumulative across the whole goal run, and every model request

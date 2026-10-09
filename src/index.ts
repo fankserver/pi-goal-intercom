@@ -33,8 +33,10 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
-import { appendFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 /**
  * Stable event-bus channel names, defined locally so this package stays
@@ -110,6 +112,52 @@ function log(msg: string): void {
 	} catch {
 		/* diagnostics must never break the session */
 	}
+}
+
+/*
+ * Replay protection. A session resume or `/reload` re-presents the ENTIRE stored
+ * message history to the `context` handler, so an hours-old command text arrives
+ * again looking exactly like a fresh delivery. On 2026-10-09 a restarted session
+ * re-executed a `GOAL:START` from earlier that day and spent 72 seconds of real
+ * paid turns re-running an objective that had finished hours before. An
+ * in-memory dedupe set cannot survive that boundary, so there are two
+ * independent guards, each able to catch what the other misses:
+ *   1. the delivery stamp predates this process — replayed history cannot be
+ *      newer than the process that is reading it;
+ *   2. the delivery id is in a file-backed acted-on record that does survive it.
+ */
+const STATE_DIR = process.env.PI_GOAL_INTERCOM_STATE_DIR ?? join(homedir(), ".pi", "agent");
+const PROCESSED_PATH = join(STATE_DIR, "pi-goal-intercom-processed.json");
+const MAX_PROCESSED_KEYS = 400;
+
+/** Clock-skew allowance for the replay gate. */
+const REPLAY_GRACE_MS = 5000;
+
+export interface EnvelopeMeta {
+	id?: string;
+	deliveredMs?: number;
+}
+
+/** Read the pi-intercom delivery envelope for idempotency and replay facts. */
+export function envelopeMeta(text: string): EnvelopeMeta {
+	const head = text.slice(0, 600);
+	const out: EnvelopeMeta = {};
+	const id = /_id\s+([0-9a-f][0-9a-f-]{7,39})/u.exec(head);
+	if (id?.[1]) out.id = id[1];
+	for (const field of ["injected", "receiver received", "broker delivered", "sent"]) {
+		const m = new RegExp(`${field}\\s+(\\d{4}-\\d{2}-\\d{2}T[\\d:.]+Z)`, "u").exec(head);
+		const ms = m?.[1] ? Date.parse(m[1]) : Number.NaN;
+		if (!Number.isNaN(ms)) {
+			out.deliveredMs = ms;
+			break;
+		}
+	}
+	return out;
+}
+
+/** Stable key for a command message: its delivery id, or a content digest. */
+export function commandKey(id: string | undefined, text: string): string {
+	return id ?? `h:${createHash("sha256").update(text).digest("hex").slice(0, 32)}`;
 }
 
 function messageText(content: unknown): string {
@@ -252,9 +300,36 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 		return allowed;
 	};
 
-	// Message timestamps already handled this session (dedupe across the many
-	// `context` events a single run may fire).
+	// Baseline for the replay gate: anything delivered before this factory ran is
+	// history, not a new command. `/reload` re-runs the factory, which correctly
+	// re-baselines and therefore never re-fires commands from the current chat.
+	const processStartedMs = Date.now();
+
+	// Already-acted-on command keys: in-memory for the repeated `context` events a
+	// single run causes, backed by a file so it survives resume and reload.
 	const consumed = new Set<string>();
+	let durableProcessed = new Set<string>();
+	let durableLoaded = false;
+	const ensureDurableLoaded = (): Set<string> => {
+		if (durableLoaded) return durableProcessed;
+		durableLoaded = true;
+		try {
+			const raw = JSON.parse(readFileSync(PROCESSED_PATH, "utf8")) as { keys?: unknown };
+			if (Array.isArray(raw.keys)) durableProcessed = new Set(raw.keys.filter((k) => typeof k === "string"));
+		} catch {
+			/* first run, or unreadable — the replay gate still stands on its own */
+		}
+		return durableProcessed;
+	};
+	const rememberProcessed = (key: string): void => {
+		ensureDurableLoaded().add(key);
+		try {
+			const keys = [...durableProcessed].slice(-MAX_PROCESSED_KEYS);
+			writeFileSync(PROCESSED_PATH, `${JSON.stringify({ version: 1, keys }, null, 2)}\n`);
+		} catch {
+			/* shared with sibling sessions; a lost write is covered by the replay gate */
+		}
+	};
 
 	/**
 	 * The most recent run this extension started, live or settled. `lastStatus`
@@ -599,9 +674,25 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 			const text = messageText(m.content);
 			const command = parseCommand(text);
 			if (!command) continue;
-			const key = `${m.timestamp ?? "?"}:${text.length}:${command.kind}`;
-			if (consumed.has(key)) break;
+			const meta = envelopeMeta(text);
+			// Scoped to the receiving session: a fan-out message keeps one delivery id
+			// for every target, and each target must decide for itself.
+			const key = `${sessionLabel}|${commandKey(meta.id, text)}`;
+			if (
+				meta.deliveredMs !== undefined &&
+				meta.deliveredMs < processStartedMs - REPLAY_GRACE_MS
+			) {
+				log(
+					`ignored replayed command kind=${command.kind} delivered=${new Date(meta.deliveredMs).toISOString()} (process started ${new Date(processStartedMs).toISOString()})`,
+				);
+				break;
+			}
+			if (consumed.has(key) || ensureDurableLoaded().has(key)) {
+				log(`ignored duplicate command kind=${command.kind} key=${key.slice(0, 48)}`);
+				break;
+			}
 			consumed.add(key);
+			rememberProcessed(key);
 			const sender = senderOf(m.details);
 			log(`command kind=${command.kind} from=${sender?.name ?? sender?.id?.slice(0, 8) ?? "?"}`);
 			handleCommand(command, sender);

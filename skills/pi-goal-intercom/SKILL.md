@@ -142,3 +142,6 @@ project session requires an operator to set that variable; that is their decisio
 - Never re-send an objective that already went active — wait for the terminal reply.
 - Before any retry, send `GOAL:STATUS`; do not guess from `GOAL_ALREADY_EXISTS`.
 - Report terminal status with the evidence you actually checked.
+- Restarting or reloading a target does **not** re-run its last goal — commands are
+  exactly-once per delivery id. To deliberately re-run something, send a **new**
+  message; re-pasting the old text will not re-fire it.

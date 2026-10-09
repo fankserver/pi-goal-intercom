@@ -16,16 +16,19 @@
  *
  * Run with: node test/smoke.mjs   (after `npm run build`)
  */
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-process.env.PI_GOAL_INTERCOM_LOG = join(
-	mkdtempSync(join(tmpdir(), "pgi-test-")),
-	"test.log",
-);
+const sandboxDir = mkdtempSync(join(tmpdir(), "pgi-test-"));
+process.env.PI_GOAL_INTERCOM_LOG = join(sandboxDir, "test.log");
+// The acted-on record is file-backed so it survives resume; keep the suite off the
+// real ~/.pi and let boots share one store the way sibling sessions do. Must be set
+// before dist/index.ts is first imported, because STATE_DIR is read at module load.
+process.env.PI_GOAL_INTERCOM_STATE_DIR = sandboxDir;
 
 const root = new URL("..", import.meta.url);
 const distPath = new URL("dist/index.ts", root);
@@ -148,8 +151,32 @@ function attachFakeGoal(pi, options = {}) {
 	return state;
 }
 
+/** A live delivery: fresh delivery id and a current injection stamp. */
 function envelope(from, body) {
-	return `**From ${from}** (/home/dev/project)\n\n_id 11111111-4444-4444-8888-222222222222 · seq 7 · sent now · injected now_\n\n${body}`;
+	return rawEnvelope(from, randomUUID(), new Date().toISOString(), body);
+}
+
+function rawEnvelope(from, id, injectedAt, body) {
+	return `**From ${from}** (/home/dev/project)\n\n_id ${id} · seq 7 · sent ${injectedAt} · injected ${injectedAt}_\n\n${body}`;
+}
+
+/**
+ * Re-stamp archived traffic as a live delivery, so a test that means "this arrived
+ * now" is not accidentally testing the replay gate.
+ */
+function freshen(text) {
+	const now = new Date().toISOString();
+	return text
+		.replace(/_id\s+[0-9a-f][0-9a-f-]{7,39}/u, `_id ${randomUUID()}`)
+		.replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, now);
+}
+
+/** Archive the same text as an hours-old delivery, which is what a resume replays. */
+function archive(text, ageMs = 6 * 60 * 60 * 1000) {
+	const old = new Date(Date.now() - ageMs).toISOString();
+	return text
+		.replace(/_id\s+[0-9a-f][0-9a-f-]{7,39}/u, `_id ${randomUUID()}`)
+		.replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, old);
 }
 
 async function boot(sessionName = "test-1") {
@@ -269,7 +296,9 @@ check(
 
 {
 	const t = await boot();
-	for (const content of negFixture) await t.deliverRaw(content);
+	// Re-stamped as live deliveries: these must be stopped by the PARSER, not by
+	// the replay age gate, or the test would pass for the wrong reason.
+	for (const content of negFixture) await t.deliverRaw(freshen(content));
 	check(t.starts().length === 0, "replaying all real test-1 traffic starts no goal");
 	check(t.replies().length === 0, "replaying all real test-1 traffic sends no reply");
 }
@@ -284,7 +313,7 @@ check(
 	);
 	const expectedStarts = kinds.filter((k) => k === "START").length;
 	const t = await boot();
-	for (const content of posFixture) await t.deliverRaw(content);
+	for (const content of posFixture) await t.deliverRaw(freshen(content));
 	check(
 		t.starts().length === expectedStarts,
 		"real commands still start the expected number of goals",
@@ -409,12 +438,69 @@ check(
 	if (local.length) {
 		const commands = local.filter((t) => parseCommand(t) !== undefined);
 		const t = await boot();
-		for (const content of local) await t.deliverRaw(content);
+		for (const content of local) await t.deliverRaw(freshen(content));
 		check(t.starts().length === commands.length, `local replay: ${local.length} messages, ${commands.length} commands honoured`);
 		console.log(`ok: replayed ${local.length} local transcript messages`);
 	} else {
 		console.log("skip: no local transcript replay (run scripts/make-fixtures.mjs to generate)");
 	}
+}
+
+/* ------------------------------- 6a. resume must not re-execute a command */
+
+/*
+ * The incident this guards: a session restarted at 16:24 and its `context` handler
+ * re-saw a genuine `GOAL:START` from 14:02 in the replayed history. The old dedupe
+ * key was in-memory only, so the command looked new and the session spent 72
+ * seconds of paid turns re-running an objective that had finished hours earlier.
+ */
+{
+	const genuine = JSON.parse(
+		readFileSync(new URL("test/fixtures/implementer1-legit-goal-commands.json", root), "utf8"),
+	)[0];
+
+	// Replayed history: same command text, hours-old delivery stamp.
+	const t = await boot();
+	await t.deliverRaw(archive(genuine));
+	check(t.starts().length === 0, "replayed history command starts no goal", JSON.stringify(t.starts()));
+	check(t.replies().length === 0, "replayed history command sends no acknowledgement", JSON.stringify(t.replies()));
+
+	// Same archived stamp, but a command that was never acted on and carries no
+	// envelope at all: the age gate is the only thing that can catch it, so prove
+	// the gate is not simply "no stamp means block".
+	const t2 = await boot();
+	await t2.deliverRaw(genuine.replace(/^\*\*From[\s\S]*?_\n\n/u, ""));
+	check(t2.starts().length === 1, "an unstamped live command still fires", "parser must not require an envelope");
+}
+
+/* --------------------------- 6b. acted-on record survives a session restart */
+
+/*
+ * Fresh boot, empty in-memory set, same delivery id already in the file-backed
+ * record, and stamps re-written to now so the age gate cannot be what saves us.
+ * This isolates the durable guard, which is the one that catches a replay whose
+ * envelope was re-stamped by the broker.
+ */
+{
+	const t = await boot();
+	const text = envelope("peer-coordinator", "GOAL:START durable-guard-check: reply OK and stop --tokens 200000");
+	await t.deliverRaw(text);
+	const firstStarts = t.starts().length;
+	const after = await boot();
+	await after.deliverRaw(text.replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, new Date().toISOString()));
+	check(
+		firstStarts === 1 && after.starts().length === 0,
+		"a command already acted on is not re-executed after a restart",
+		JSON.stringify({ firstStarts, secondStarts: after.starts().length }),
+	);
+
+	// And a genuinely new command after that restart must still fire.
+	await after.deliver("GOAL:START new-after-restart: reply OK and stop --tokens 200000");
+	check(after.starts().length === 1, "a new command after a restart still fires", JSON.stringify(after.starts()));
+
+	// The record is bounded and stays valid JSON on disk.
+	const store = JSON.parse(readFileSync(join(process.env.PI_GOAL_INTERCOM_STATE_DIR, "pi-goal-intercom-processed.json"), "utf8"));
+	check(Array.isArray(store.keys) && store.keys.length >= 2 && store.keys.every((k) => k.includes("|")), "acted-on record is durable, session-scoped JSON", JSON.stringify(store.keys?.slice(0, 2)));
 }
 
 /* -------------------------------------------------------- 7. scope gate holds */

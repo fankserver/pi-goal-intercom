@@ -48,6 +48,42 @@ replays the verbatim inbound traffic from `test/fixtures/` and asserts zero goal
 start, with the coordinator's real commands from the same day as a positive
 control so the fix cannot degrade into "never fire".
 
+## Replay safety on resume and reload
+
+A session resume or `/reload` re-presents the **entire stored message history** to
+the `context` handler, so a command text from hours ago arrives looking exactly
+like a fresh delivery. The first version deduped with an in-memory
+`Set<timestamp:length:kind>`, which cannot survive that boundary: on 2026-10-09 a
+session restarted at 16:24, re-saw a genuine `GOAL:START` from 14:02 in the
+replayed history, created a fresh goal (`fb245fd2`), and spent 72 seconds of real
+paid turns re-running an objective that had completed hours earlier.
+
+Two independent guards, because either can fail open alone:
+
+1. **Delivery-stamp age.** `envelopeMeta()` reads `injected` (falling back to
+   `receiver received`, `broker delivered`, `sent`) from the pi-intercom envelope.
+   A command delivered before this process started minus `REPLAY_GRACE_MS` is
+   history — replayed history cannot be newer than the process reading it. A
+   missing stamp fails **open**, so a live delivery with an unfamiliar envelope is
+   never silently dropped.
+2. **File-backed acted-on record.** `commandKey()` keys on the envelope `_id`
+   (falling back to a SHA-256 digest) scoped by receiving session name, persisted
+   to `~/.pi/agent/pi-goal-intercom-processed.json` (`PI_GOAL_INTERCOM_STATE_DIR`
+   overrides; bounded to the last 400 keys). This is what catches a replay whose
+   stamps were rewritten, and it survives reload where the memory set does not.
+
+The record is shared by sibling sessions and written read-modify-write: a lost
+concurrent write is benign because guard 1 still stands. Session scoping in the key
+matters because a fan-out message keeps one delivery id for every target, and each
+target must decide for itself.
+
+`test/smoke.mjs` maps these directly: replaying a genuine command with an hours-old
+stamp starts nothing, the same command with current stamps does start, and — the
+case that isolates the durable guard — a fresh boot with an empty memory set, the
+same delivery id already recorded, and stamps re-written to now still starts
+nothing. Negative fixtures are re-stamped as live deliveries, so they are stopped by
+the **parser** rather than passing for the wrong reason under the age gate.
+
 ## Why the `context` event is the trigger
 
 Inbound intercom messages do **not** fire a dedicated "message received" event
