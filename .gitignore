@@ -1,0 +1,7 @@
+node_modules/
+npm-debug.log*
+*.tgz
+.DS_Store
+# dist/index.ts is intentionally COMMITTED: it is the loadable runtime Pi reads
+# from `pi.extensions`, so a fresh git clone installs and loads with no build step.
+# Regenerate it with `npm run build` after editing src/.
