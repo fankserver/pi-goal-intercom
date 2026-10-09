@@ -68,6 +68,27 @@ The sender gets status replies back over intercom:
 🛑 GOAL:CANCEL sent for run 12ab…
 ```
 
+## Bundled skill (so agents know it exists)
+
+The package ships a skill, `pi-goal-intercom`, declaring the protocol to agents.
+Without it the capability is invisible — README/docs are never read by a model,
+so a session would not know `GOAL:START` exists.
+
+Pi advertises the skill's name + description at startup and loads the full
+instructions when a task matches (delegating autonomous work to a peer session,
+"set a goal" for another session, reporting a delegated goal's outcome). Force
+it with:
+
+```text
+/skill:pi-goal-intercom
+```
+
+It documents both sides: sender-side `GOAL:START` / `GOAL:CANCEL` syntax and
+budgets, the status replies to expect, a failure table (`RPC_DISABLED`,
+`GOAL_ALREADY_EXISTS`, silent no-op), the session-name scope gate, and the
+things that **cannot** work (no goal-start tool; `/goal` in a message body is
+inert). Restart the session after installing so the skill is discovered.
+
 ## Requirements
 
 | Requirement | Why | If missing |
@@ -100,6 +121,10 @@ npm run typecheck   # tsc --noEmit
 npm run build       # verify + stage dist/index.ts (committed)
 npm run check       # build + smoke test
 ```
+
+Skills are declared explicitly under `pi.skills` in `package.json` (an explicit
+`pi` manifest disables conventional directory discovery) and live in
+`skills/<name>/SKILL.md` with Agent Skills spec frontmatter.
 
 After editing `src/`, always `npm run build` and commit the regenerated
 `dist/index.ts` — it is what Pi loads. See
