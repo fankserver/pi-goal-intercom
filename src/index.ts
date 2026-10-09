@@ -662,8 +662,9 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 	pi.on("context", (event) => {
 		if (!gate()) return;
 		const messages = (event as { messages?: unknown[] }).messages ?? [];
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const m = messages[i] as {
+		const actionable: Array<{ command: ParsedCommand; sender?: IntercomSender; key: string }> = [];
+		for (const raw of messages) {
+			const m = raw as {
 				role?: string;
 				customType?: string;
 				content?: unknown;
@@ -685,18 +686,23 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 				log(
 					`ignored replayed command kind=${command.kind} delivered=${new Date(meta.deliveredMs).toISOString()} (process started ${new Date(processStartedMs).toISOString()})`,
 				);
-				break;
+				continue;
 			}
 			if (consumed.has(key) || ensureDurableLoaded().has(key)) {
 				log(`ignored duplicate command kind=${command.kind} key=${key.slice(0, 48)}`);
-				break;
+				continue;
 			}
-			consumed.add(key);
-			rememberProcessed(key);
-			const sender = senderOf(m.details);
-			log(`command kind=${command.kind} from=${sender?.name ?? sender?.id?.slice(0, 8) ?? "?"}`);
-			handleCommand(command, sender);
-			break;
+			actionable.push({ command, sender: senderOf(m.details), key });
+		}
+		// Oldest first, and never stop at the first hit. Walking newest-first and
+		// breaking meant that when two commands arrived between two prompt builds,
+		// only the newer one was ever handled: the next scan met the newer one in the
+		// dedupe set, stopped there, and the queued older command could never run.
+		for (const item of actionable) {
+			consumed.add(item.key);
+			rememberProcessed(item.key);
+			log(`command kind=${item.command.kind} from=${item.sender?.name ?? item.sender?.id?.slice(0, 8) ?? "?"}`);
+			handleCommand(item.command, item.sender);
 		}
 	});
 

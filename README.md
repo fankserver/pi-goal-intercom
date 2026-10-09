@@ -84,8 +84,10 @@ a command that already ran arrives again looking brand new. Commands are therefo
 **exactly-once per delivery**: the envelope delivery stamp must not predate this
 process, and the delivery id is recorded durably in
 `~/.pi/agent/pi-goal-intercom-processed.json` (`PI_GOAL_INTERCOM_STATE_DIR`
-overrides). Restarting a session will not silently re-run its last goal — which also
-means re-pasting the same objective text will not re-fire it; send a new message.
+overrides). Restarting a session therefore never silently re-runs its last goal.
+Dedupe is per **delivery**, not per text: a deliberate retry re-sending the same
+objective is a new delivery and does act again, which is what makes a retry
+predictable.
 
 ## Sizing `--tokens`
 

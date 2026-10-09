@@ -143,5 +143,5 @@ project session requires an operator to set that variable; that is their decisio
 - Before any retry, send `GOAL:STATUS`; do not guess from `GOAL_ALREADY_EXISTS`.
 - Report terminal status with the evidence you actually checked.
 - Restarting or reloading a target does **not** re-run its last goal — commands are
-  exactly-once per delivery id. To deliberately re-run something, send a **new**
-  message; re-pasting the old text will not re-fire it.
+  exactly-once per **delivery**. Dedupe keys on the delivery, not the text, so an
+  intentional retry that re-sends the same objective is a new delivery and does act.

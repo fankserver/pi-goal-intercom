@@ -195,13 +195,25 @@ async function boot(sessionName = "test-1") {
 		await flush();
 	};
 	const deliver = (body, from = "peer-coordinator") => deliverRaw(envelope(from, body), from);
+	/** One scan over several messages, which is what a real `context` event is. */
+	const deliverMany = async (contents, from = "peer-coordinator") => {
+		const list = contents.map((content, i) => ({
+			role: "custom",
+			customType: "intercom_message",
+			content,
+			timestamp: Date.now() + i,
+			details: { from: { name: from, id: "01a10c38-837a-717e" } },
+		}));
+		for (const fn of pi._handlers.get("context") ?? []) await fn({ messages: list });
+		await flush();
+	};
 	const replies = () =>
 		pi._emitted
 			.filter((e) => e.channel === OUTBOX)
 			.map((e) => String(e.data?.message ?? ""));
 	const starts = () => pi._emitted.filter((e) => e.channel === START_CHANNEL).map((e) => e.data);
 	const cancels = () => pi._emitted.filter((e) => e.channel === CANCEL_CHANNEL).map((e) => e.data);
-	return { pi, goal, deliver, deliverRaw, replies, starts, cancels };
+	return { pi, goal, deliver, deliverRaw, deliverMany, replies, starts, cancels };
 }
 
 /**
@@ -501,6 +513,45 @@ check(
 	// The record is bounded and stays valid JSON on disk.
 	const store = JSON.parse(readFileSync(join(process.env.PI_GOAL_INTERCOM_STATE_DIR, "pi-goal-intercom-processed.json"), "utf8"));
 	check(Array.isArray(store.keys) && store.keys.length >= 2 && store.keys.every((k) => k.includes("|")), "acted-on record is durable, session-scoped JSON", JSON.stringify(store.keys?.slice(0, 2)));
+}
+
+/* --------------- 6c. two commands arriving together must BOTH be honoured */
+
+/*
+ * A `context` event carries the whole history, so when two commands land between
+ * prompt builds the extension sees them in one scan. Walking newest-first and
+ * stopping at the first hit meant only the newer one ever ran: the next scan met
+ * the newer command already in the dedupe set, stopped there, and the queued older
+ * command was unreachable forever.
+ */
+{
+	const t = await boot();
+	const statusMsg = envelope("peer-coordinator", "GOAL:STATUS");
+	const startMsg = envelope(
+		"peer-coordinator",
+		"GOAL:START queued-pair: reply OK and stop --tokens 200000",
+	);
+	await t.deliverMany([statusMsg, startMsg]);
+	check(t.starts().length === 1, "queued START dispatched", JSON.stringify(t.starts()));
+	check(
+		t.replies().some((r) => r.includes("GOAL:STATUS")),
+		"queued STATUS not starved by the newer START",
+		JSON.stringify(t.replies()),
+	);
+
+	// Oldest first, so the operator sees the status answer before the start ack.
+	await driveStatus(t, t.starts()[0].runId, "active");
+	const statusIdx = t.replies().findIndex((r) => r.includes("GOAL:STATUS"));
+	const activeIdx = t.replies().findIndex((r) => r.includes("GOAL active"));
+	check(
+		statusIdx >= 0 && activeIdx > statusIdx,
+		"queued commands dispatched oldest-first",
+		JSON.stringify({ statusIdx, activeIdx }),
+	);
+
+	// Re-scanning the same history runs neither again.
+	await t.deliverMany([statusMsg, startMsg]);
+	check(t.starts().length === 1, "re-scan re-runs neither queued command", JSON.stringify(t.starts()));
 }
 
 /* -------------------------------------------------------- 7. scope gate holds */
