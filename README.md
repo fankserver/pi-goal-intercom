@@ -97,15 +97,32 @@ cost `input 39,837 + cacheRead 20,096 + output 93 = 60,026` tokens — 60k bille
 for 93 tokens of work. Therefore:
 
 ```text
-cost ≈ turns × contextTokens   →   --tokens ≥ planned_turns × contextTokens × 1.3
+cost ≈ turns × contextTokens   →   --tokens ≥ max(150000, planned_turns × contextTokens × 1.3)
 ```
 
-Read `contextTokens` from `intercom list`. A budget below one turn is worse than
-no budget: it burns a request, produces nothing, and parks the goal in
-`budget_limited`, which then rejects every new start. Size for the whole
-horizon — some goals run for weeks, `automaticTurns` is unlimited by design, and
-runaway loops are caught by `noProgressTurns` plus repeated-output fingerprinting,
-not by a turn cap. For long goals the dominant lever is context size.
+**Leave it out unless you have a specific reason to cap spend.** `--tokens` is
+honoured when you pass it — dropping a ceiling you asked for would run past what you
+authorized — but it is not part of the recommended form, because its failure mode is
+state damage rather than a clean stop:
+
+- The budget is cumulative **cost**, not work, so it cannot be sized from the
+  objective alone.
+- Exhausting it leaves a stopped goal holding the slot, which managed cancel cannot
+  free; a human must run `/goal edit --tokens` inside that session.
+- Below roughly one turn it is strictly negative: one request burned, no work, slot
+  jammed. Observed at 40k and 60k against warmed 140k–235k sessions.
+
+So the extension enforces a **floor of 150,000** in code rather than trusting
+documentation — an earlier version of this skill recommended sizing budgets, several
+coordinators obliged, and four sessions jammed. Anything below the floor is refused
+with `BUDGET_TOO_LOW`, and a malformed value (`--tokens abc`, `--tokens 40k`) is
+refused too rather than quietly treated as "no budget", which would run unbounded
+after you asked for a cap.
+
+Read `contextTokens` from `intercom list` and size for the whole horizon.
+`automaticTurns` is unlimited by design; runaway loops are caught by `noProgressTurns`
+plus repeated-output fingerprinting, not by a turn cap. For long goals the dominant
+lever is context size.
 
 ## Recovering a stuck goal slot
 

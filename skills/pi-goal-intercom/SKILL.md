@@ -47,6 +47,10 @@ Do **not** try these — they do not work, so do not waste a turn on them:
 ## Commands
 
 ```typescript
+// Recommended — no budget:
+intercom({ action: "send", to: "<target-session>", message: "GOAL:START <objective>" });
+
+// Only when an explicit ceiling is required (floor 150000):
 intercom({ action: "send", to: "<target-session>", message: "GOAL:START <objective> --tokens 800000" });
 ```
 
@@ -57,7 +61,35 @@ intercom({ action: "send", to: "<target-session>", message: "GOAL:START <objecti
 - `GOAL:CANCEL [reason]` is dispatched to pi-goal and **confirmed from its answer**.
 - Check the target's name and context first: `intercom({ action: "list" })`.
 
-## Sizing `--tokens` (the mistake that jams sessions)
+## Budget: optional, and you almost certainly want to omit it
+
+`GOAL:START <objective>` with **no** budget is the recommended form. Pass `--tokens`
+only when someone explicitly needs a spend ceiling, and know that passing it is
+honoured, not ignored — refusing a ceiling you asked for would mean running past your
+authorization.
+
+Prefer omitting it, and say why to whoever asks:
+
+- A budget measures cumulative **cost**, not remaining work, so it cannot be sized
+  from the objective. The dispatcher would have to know the target's context size and
+  turn count in advance.
+- Running out does not cleanly stop anything: it leaves a stopped goal holding the
+  slot, and managed cancel cannot free it. A human must run `/goal edit --tokens`
+  inside that session.
+- A loop is bounded by `noProgressTurns` and repeated-tool-free-output fingerprinting,
+  which discriminate a stuck agent from a merely long one. A token ceiling cannot, and
+  charges long productive runs the same as loops.
+- `automaticTurns: null` is intended here. Never propose a turn cap.
+
+**The extension enforces a 150,000-token floor in code**, and refuses a malformed
+value instead of treating it as "no budget". This is a code guard on purpose: an
+earlier version of this skill told dispatchers to size budgets, they obliged with
+40k/60k against 140k–235k contexts, and four sessions jammed. Documentation did not
+hold that line, so it is not where the protection sits. If a hard cap must go lower
+than the floor, a human sets it in person with `/goal --tokens <N>`, where someone
+owns the spend decision.
+
+## Sizing `--tokens` when you really do need one
 
 The budget is **cumulative for the whole goal run**, and every model request
 re-sends the entire conversation, with cached prompt input billed. From a real

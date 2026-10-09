@@ -13,7 +13,7 @@
  * messages, extracts the marker + objective, and drives the pi-goal Managed Run
  * RPC over the shared `pi.events` bus:
  *
- *   - "pi-goal:start"   with { runId, objective, tokenBudget? }
+ *   - "pi-goal:start"   with { runId, objective, tokenBudget? }  (budget optional, floored)
  *   - "pi-goal:cancel"  with { runId, reason }
  *   - "pi-goal:event:<runId>" to observe state and terminal events
  *
@@ -129,6 +129,14 @@ function log(msg: string): void {
 const STATE_DIR = process.env.PI_GOAL_INTERCOM_STATE_DIR ?? join(homedir(), ".pi", "agent");
 const PROCESSED_PATH = join(STATE_DIR, "pi-goal-intercom-processed.json");
 const MAX_PROCESSED_KEYS = 400;
+
+/**
+ * Lowest budget this bridge will honour, in tokens. Sized from production jams at
+ * 40k/60k against warmed 140k-235k contexts: below roughly one turn a budget is pure
+ * loss, and the loss is a jammed slot rather than a clean stop. It is a floor, not a
+ * default — the recommended setting is no budget at all.
+ */
+const MIN_TOKEN_BUDGET = 150000;
 
 /** Clock-skew allowance for the replay gate. */
 const REPLAY_GRACE_MS = 5000;
@@ -341,6 +349,8 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 		runId: string;
 		objective: string;
 		sender?: IntercomSender;
+		/** Echoed in the ack so a senders sees what they opted into. */
+		tokenBudget?: number;
 		/** True between the `active` state event and a terminal event. */
 		live: boolean;
 		settled: boolean;
@@ -455,31 +465,50 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 			replyTo(sender, "⚠️ GOAL:START ignored: objective missing or >4000 chars.");
 			return;
 		}
-		// Optional trailing token budget: "GOAL:START ... --tokens 50000".
-		const tokensMatch = /--tokens\s+(\d+)\s*$/.exec(trimmed);
-		const budgetText = tokensMatch ? tokensMatch[1] : undefined;
-		const objectiveText = tokensMatch
-			? trimmed.slice(0, tokensMatch.index).trim()
-			: trimmed;
-		if (!objectiveText) {
-			log("skip: empty objective after budget parsing");
-			return;
+		// An explicit budget is honoured when given — a sender asking for a ceiling is
+		// expressing a spend authorization, and silently dropping it would run past what
+		// they agreed to. It is not advertised, because the flag is a footgun whose
+		// failure mode is state damage rather than a clean stop: budgets are cumulative
+		// COST (about turns x contextTokens with cached prompt input billed), which a
+		// dispatcher cannot estimate from the objective, and exhausting one leaves a
+		// stopped goal holding the slot that managed cancel cannot free, so a human has
+		// to raise it inside that session. Observed at 40k and 60k against warmed
+		// 140k-235k sessions: one full request burned, no work produced, four slots
+		// jammed. Prose alone did not prevent that — the skill once recommended sizing
+		// budgets and the coordinators obliged — so the protection is this floor.
+		// Deliberately permissive: matching only a well-formed number would let
+		// `--tokens 40k` or `--tokens abc` fall through as prose and start an UNBOUNDED
+		// run, which is the opposite of what a sender typing a ceiling asked for. Anything
+		// shaped like an attempted ceiling must be handled here or refused.
+		const tokensMatch = /(?:^|\s)--tokens\s+(\S+)\s*$/u.exec(trimmed);
+		const objectiveText = tokensMatch ? trimmed.slice(0, tokensMatch.index).trim() : trimmed;
+		let tokenBudget: number | undefined;
+		if (tokensMatch?.[1]) {
+			const requested = Number(tokensMatch[1]);
+			if (!Number.isSafeInteger(requested) || requested <= 0) {
+				log(`skip: invalid tokenBudget=${JSON.stringify(tokensMatch[1])}`);
+				replyTo(sender, "⚠️ GOAL:START ignored: --tokens must be a positive whole number, or omit it entirely.");
+				return;
+			}
+			if (requested < MIN_TOKEN_BUDGET) {
+				log(`reject reason=budget_too_low requested=${requested} floor=${MIN_TOKEN_BUDGET}`);
+				replyTo(
+					sender,
+					`⚠️ GOAL:START rejected (BUDGET_TOO_LOW): ${requested} is below the ${MIN_TOKEN_BUDGET} floor and would likely be less than a single turn. Each request re-sends the whole conversation with cached prompt input billed, so a small budget burns one request, produces no work, and then leaves a stopped goal in this slot that managed cancel cannot free — a human must raise it in "${sessionLabel}". Prefer omitting --tokens (loop protection is pi-goal's no-progress detection, not a spend ceiling). If you genuinely need a cap, re-send with at least ${MIN_TOKEN_BUDGET}, sized as turns x contextTokens x 1.3.`,
+				);
+				return;
+			}
+			tokenBudget = requested;
+			log(`budget accepted requested=${requested} floor=${MIN_TOKEN_BUDGET}`);
 		}
-		const tokenBudget =
-			budgetText !== undefined ? Number(budgetText) : undefined;
-		if (tokenBudget !== undefined && (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0)) {
-			log(`skip: invalid tokenBudget=${budgetText}`);
-			replyTo(sender, "⚠️ GOAL:START ignored: invalid --tokens value.");
-			return;
-		}
-
+		const runId = `pgi-${randomUUID()}`;
 		// Capture the replaced run before overwriting it, so a GOAL_ALREADY_EXISTS
 		// rejection can name the status the previous goal actually died in.
 		const previousStatus = currentRun?.lastStatus ?? currentRun?.previousStatus;
-		const runId = `pgi-${randomUUID()}`;
 		const run: ManagedRun = {
 			runId,
 			objective: objectiveText,
+			tokenBudget,
 			sender,
 			live: false,
 			settled: false,
@@ -492,8 +521,10 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 		currentRun = run;
 
 		log(
-			`start runId=${runId} objective=${JSON.stringify(objectiveText)} tokenBudget=${tokenBudget ?? "none"} sender=${sender?.name ?? sender?.id?.slice(0, 8) ?? "unknown"}`,
+			`start runId=${runId} objective=${JSON.stringify(objectiveText)} sender=${sender?.name ?? sender?.id?.slice(0, 8) ?? "unknown"}`,
 		);
+		// An absent budget means "let pi-goal apply its own configured behaviour",
+		// which is what a multi-week goal needs and the recommended path.
 		pi.events.emit(GOAL_START_CHANNEL, {
 			runId,
 			objective: objectiveText,
@@ -545,7 +576,14 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 
 		if (event.status === "active") {
 			run.live = true;
-			replyTo(run.sender, `▶️ GOAL active: ${short(run.objective)}`);
+			replyTo(
+				run.sender,
+				`▶️ GOAL active: ${short(run.objective)}${
+					run.tokenBudget !== undefined
+						? ` (budget ${run.tokenBudget.toLocaleString("en-US")} tokens — cumulative across the run; if it is reached, only a human can raise it in "${sessionLabel}")`
+						: ""
+				}`,
+			);
 			return;
 		}
 
@@ -585,7 +623,7 @@ export default function goalIntercom(pi: ExtensionAPI): void {
 	 */
 	function budgetRecoveryHint(status: string | undefined): string {
 		if (status !== "budget_limited") return "";
-		return ` Recovery: ask a human to run \`/goal edit --tokens <higher>\` in "${sessionLabel}" — it raises the ceiling and resumes THIS goal with its objective, progress, and cumulative usage intact. Do NOT run \`/goal clear\`: that discards the objective and every accumulated turn. Budgets are cumulative across the whole run while each turn re-sends the full context, so a large goal legitimately needs a large budget.`;
+		return ` Recovery: ask a human to run \`/goal edit --tokens <higher>\` in "${sessionLabel}" — it raises the ceiling and resumes THIS goal with its objective, progress, and cumulative usage intact. Do NOT run \`/goal clear\`: that discards the objective and every accumulated turn. Budgets are cumulative across the whole run while each turn re-sends the full context, so a large goal legitimately needs a large one — but only a human sets it here now, because this bridge never does.`;
 	}
 
 	function handleCancel(reason: string | undefined, sender?: IntercomSender): void {

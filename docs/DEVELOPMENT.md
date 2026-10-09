@@ -20,6 +20,34 @@ it stays dependency-free and cannot break when those packages change internals:
 Goal runIds are `pgi-<uuid>`, which satisfies pi-goal's
 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`.
 
+## Budget: optional, discouraged, floored in code
+
+`--tokens` is accepted and forwarded when supplied, because a sender naming a ceiling
+is expressing a spend authorization and silently dropping it would spend more than
+they agreed to. It is absent from every recommended form, and the discouragement is
+**not** carried by documentation alone.
+
+Evidence, not theory: an earlier revision of the bundled skill taught dispatchers to
+size budgets; coordinators obliged with 40k and 60k against warmed 140k–235k contexts;
+each one burned a single full request, produced no work, and left a `budget_limited`
+goal holding the slot that nothing on the bus could free — four sessions at once. A
+named, self-explanatory parameter out-competes prose telling agents to ignore it,
+particularly toward a *motivated* error: senders want a cost cap.
+
+Therefore `MIN_TOKEN_BUDGET = 150000` refuses anything lower with `BUDGET_TOO_LOW`,
+explaining the cumulative-cost model, the jam, and the human-only recovery, and
+recommending omission. The trailing-flag pattern deliberately matches `(\S+)` rather
+than `(\d+)`: matching only a well-formed number let `--tokens abc` fall through as
+objective prose and start an **unbounded** run — the exact opposite of what someone
+typing a ceiling intended. Anything shaped like an attempted ceiling must be honoured
+or refused loudly, never ignored.
+
+Regression coverage is mutation-checked with the mutant required to compile and to be
+present in `dist/` before a result is read: lowering the floor fails the sub-floor
+checks, and narrowing the pattern back to digits fails the malformed-ceiling checks.
+A blank compile or a stale bundle is treated as an invalid mutant, because a green
+suite over an artifact that was never rebuilt measures nothing.
+
 ## Two pi-goal behaviours this package exists around
 
 Both are upstream facts, verified in `src/run-protocol.ts`, and the extension is

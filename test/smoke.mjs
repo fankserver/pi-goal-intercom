@@ -323,13 +323,26 @@ check(
 		"genuine commands still parse",
 		JSON.stringify(kinds),
 	);
+	// The coordinator's real traffic passed `--tokens 300000`, which is above the
+	// floor: those starts must be honoured, because dropping a requested ceiling would
+	// run past the spend the sender authorized.
+	const flagged = posFixture.filter(
+		(t) => parseCommand(t)?.kind === "START" && /(?:^|\s)--tokens\s+\d+\s*$/u.test(String(parseCommand(t)?.argument)),
+	);
 	const expectedStarts = kinds.filter((k) => k === "START").length;
+	check(flagged.length === 2, "fixture really contains budget-carrying starts", String(flagged.length));
 	const t = await boot();
 	for (const content of posFixture) await t.deliverRaw(freshen(content));
 	check(
 		t.starts().length === expectedStarts,
 		"real commands still start the expected number of goals",
 		`${t.starts().length} started, expected ${expectedStarts}`,
+	);
+	check(
+		t.starts().filter((x) => x.tokenBudget !== undefined).every((x) => x.tokenBudget === 300000) &&
+			t.starts().filter((x) => x.tokenBudget !== undefined).length === flagged.length,
+		"each above-floor budget is forwarded intact and only where asked",
+		JSON.stringify(t.starts().map((x) => x.tokenBudget)),
 	);
 	check(t.cancels().length > 0, "real cancel commands still dispatch a cancel");
 	// A forwarded objective must be the task itself, never quoted report prose.
@@ -339,9 +352,9 @@ check(
 		JSON.stringify(t.starts().map((s) => String(s.objective).slice(0, 40))),
 	);
 	check(
-		t.starts().every((s) => typeof s.tokenBudget === "number" || !String(s.objective).includes("--tokens")),
-		"a forwarded objective never leaks the --tokens flag into the goal text",
-		JSON.stringify(t.starts().map((s) => String(s.objective).slice(-30))),
+		t.starts().every((s) => "tokenBudget" in s ? s.tokenBudget >= 150000 : true),
+		"no start ever carries a sub-floor budget",
+		JSON.stringify(t.starts().map((s) => s.tokenBudget)),
 	);
 }
 
@@ -349,9 +362,9 @@ check(
 
 {
 	const t = await boot();
-	await t.deliver("GOAL:START observe the CI run until terminal --tokens 40000");
+	await t.deliver("GOAL:START observe the CI run until terminal");
 	check(t.starts().length === 1, "legitimate start emits exactly one managed start");
-	check(t.starts()[0]?.tokenBudget === 40000, "budget forwarded to pi-goal");
+	check(!("tokenBudget" in (t.starts()[0] ?? {})), "no budget forwarded to pi-goal", JSON.stringify(t.starts()[0]));
 	check(t.replies().some((r) => r.includes("GOAL active")), "active acknowledged");
 
 	// Exhaust the budget the way the real session did, then cancel it.
@@ -387,7 +400,7 @@ check(
 
 {
 	const t = await boot();
-	await t.deliver("GOAL:START observe CI --tokens 40000");
+	await t.deliver("GOAL:START observe CI");
 	const runId = t.starts()[0].runId;
 	await driveStatus(t, runId, "budget_limited", "token budget reached");
 	const before = t.replies().length;
@@ -414,8 +427,8 @@ check(
 		for (const fn of pi._handlers.get("context") ?? []) await fn({ messages: [message] });
 		await flush();
 	};
-	await deliverLocal("GOAL:START first objective --tokens 500000");
-	await deliverLocal("GOAL:START second objective --tokens 500000");
+	await deliverLocal("GOAL:START first objective");
+	await deliverLocal("GOAL:START second objective");
 	const replies = pi._emitted
 		.filter((e) => e.channel === OUTBOX)
 		.map((e) => String(e.data?.message ?? ""));
@@ -467,9 +480,12 @@ check(
  * seconds of paid turns re-running an objective that had finished hours earlier.
  */
 {
-	const genuine = JSON.parse(
+	// Index 4 is the coordinator's one objective with no trailing budget flag, so it is
+	// expected to start; index 0 carries a budget and is refused.
+	const fixture = JSON.parse(
 		readFileSync(new URL("test/fixtures/implementer1-legit-goal-commands.json", root), "utf8"),
-	)[0];
+	);
+	const genuine = fixture[4];
 
 	// Replayed history: same command text, hours-old delivery stamp.
 	const t = await boot();
@@ -495,7 +511,7 @@ check(
  */
 {
 	const t = await boot();
-	const text = envelope("peer-coordinator", "GOAL:START durable-guard-check: reply OK and stop --tokens 200000");
+	const text = envelope("peer-coordinator", "GOAL:START durable-guard-check: reply OK and stop");
 	await t.deliverRaw(text);
 	const firstStarts = t.starts().length;
 	const after = await boot();
@@ -507,7 +523,7 @@ check(
 	);
 
 	// And a genuinely new command after that restart must still fire.
-	await after.deliver("GOAL:START new-after-restart: reply OK and stop --tokens 200000");
+	await after.deliver("GOAL:START new-after-restart: reply OK and stop");
 	check(after.starts().length === 1, "a new command after a restart still fires", JSON.stringify(after.starts()));
 
 	// The record is bounded and stays valid JSON on disk.
@@ -529,7 +545,7 @@ check(
 	const statusMsg = envelope("peer-coordinator", "GOAL:STATUS");
 	const startMsg = envelope(
 		"peer-coordinator",
-		"GOAL:START queued-pair: reply OK and stop --tokens 200000",
+		"GOAL:START queued-pair: reply OK and stop",
 	);
 	await t.deliverMany([statusMsg, startMsg]);
 	check(t.starts().length === 1, "queued START dispatched", JSON.stringify(t.starts()));
@@ -554,11 +570,86 @@ check(
 	check(t.starts().length === 1, "re-scan re-runs neither queued command", JSON.stringify(t.starts()));
 }
 
+/* --------------------------------------- 6d. budgets are optional, discouraged, floored */
+
+/*
+ * An explicit ceiling is honoured (dropping one would exceed what the sender
+ * authorized), but the parameter's failure mode is a jammed slot rather than a clean
+ * stop, and skill prose once actively invited the flag — coordinators obliged and four
+ * sessions stuck at 40k/60k. So the protection is a floor in code, not a warning in
+ * documentation.
+ */
+{
+	const t = await boot();
+
+	// The observed jam values, replayed: both must be refused, not honoured.
+	for (const low of [40000, 60000, 149999]) {
+		await t.deliver(`GOAL:START observe CI run until terminal --tokens ${low}`);
+	}
+	check(t.starts().length === 0, "sub-floor budgets dispatch nothing", JSON.stringify(t.starts()));
+	const refusal = t.replies()[0] ?? "";
+	check(refusal.includes("BUDGET_TOO_LOW"), "refusal names the code", refusal.slice(0, 60));
+	check(refusal.includes("floor"), "refusal explains the floor", refusal.slice(0, 80));
+	check(
+		refusal.includes("omitting --tokens") && refusal.includes("no-progress"),
+		"refusal recommends the unbudgeted path and names the real brake",
+		refusal.slice(80, 220),
+	);
+	check(
+		refusal.includes("/goal edit --tokens") || refusal.includes("human must raise"),
+		"refusal discloses that exhaustion needs a human",
+		refusal.slice(-160),
+	);
+
+	// At and above the floor the sender's ceiling is honoured exactly.
+	await t.deliver("GOAL:START observe CI run until terminal --tokens 150000");
+	check(t.starts().length === 1, "an at-floor budget is honoured", JSON.stringify(t.starts()));
+	check(t.starts()[0]?.tokenBudget === 150000, "the floor boundary is inclusive", JSON.stringify(t.starts()[0]));
+
+	// A malformed value is not silently treated as "no budget" — that would run
+	// unbounded past the ceiling the sender tried to set.
+	const before = t.starts().length;
+	await t.deliver("GOAL:START observe CI run until terminal --tokens abc");
+	check(t.starts().length === before, "a malformed budget does not start an unbounded run", JSON.stringify(t.starts()));
+	check(
+		(t.replies().at(-1) ?? "").includes("positive whole number"),
+		"a malformed budget is reported, not ignored",
+		(t.replies().at(-1) ?? "").slice(0, 70),
+	);
+
+	// No flag at all remains the clean path.
+	await t.deliver("GOAL:START plain long horizon objective");
+	check(
+		t.starts().length === before + 1 && !("tokenBudget" in t.starts().at(-1)),
+		"omitting the flag starts with no budget",
+		JSON.stringify(t.starts().at(-1)),
+	);
+
+	// A protocol mention inside the objective is prose, not a flag.
+	await t.deliver("GOAL:START document the --tokens flag and its removal in the changelog");
+	const prose = t.starts().at(-1);
+	check(
+		String(prose?.objective).includes("--tokens") && !("tokenBudget" in (prose ?? {})),
+		"a prose mention of the flag is not mistaken for a budget",
+		JSON.stringify(prose),
+	);
+
+	// Choosing a budget discloses what was chosen, at the moment of choosing.
+	await t.deliver("GOAL:START bounded objective with a real ceiling --tokens 400000");
+	await driveStatus(t, t.starts().at(-1).runId, "active");
+	const ack = t.replies().at(-1) ?? "";
+	check(
+		ack.includes("400,000") && ack.includes("cumulative") && ack.includes("human"),
+		"the ack discloses the budget is cumulative and human-bounded",
+		ack.slice(0, 160),
+	);
+}
+
 /* -------------------------------------------------------- 7. scope gate holds */
 
 {
 	const t = await boot("worker-1");
-	await t.deliver("GOAL:START should never run here --tokens 1000");
+	await t.deliver("GOAL:START should never run here");
 	check(t.starts().length === 0, "a session outside the gate stays inert");
 	check(t.replies().length === 0, "out-of-scope session stays silent");
 }
